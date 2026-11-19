@@ -10,6 +10,7 @@ input/request.json says how to run the model:
      "top_logprobs": 20,               # how many of the model's likeliest first tokens to read
      "chunk_size": 512,                # prompts per vLLM call; results are saved after each
      "gpu_memory_utilization": 0.9,
+     "max_num_seqs": 128,              # prompts worked on at once (see DEFAULTS)
      "seed": 0}
 input/prompts.jsonl.gz holds one prompt per line:
     {"id": "...", "messages": [{"role": "system" | "user", "content": "..."}, ...],
@@ -57,6 +58,10 @@ DEFAULTS = {
     "top_logprobs": 20,
     "chunk_size": 512,
     "gpu_memory_utilization": 0.9,
+    # How many prompts vLLM works on at once. Qwen3.8 is a hybrid (Mamba) model: each prompt
+    # in flight needs a Mamba cache block, and an L40 has room for about 208 (Blythe,
+    # 19 Nov 2026), so vLLM's default of 256 fails at start-up.
+    "max_num_seqs": 128,
     "seed": 0,
 }
 THINK_OPEN, THINK_CLOSE = "<think>", "</think>"
@@ -217,6 +222,7 @@ def load_model(model_dir: Path, request: dict):
         model=str(model_dir),
         max_model_len=request["max_model_len"],
         gpu_memory_utilization=request["gpu_memory_utilization"],
+        max_num_seqs=request["max_num_seqs"],
         seed=request["seed"],
         max_logprobs=max(20, request["top_logprobs"]),
     )

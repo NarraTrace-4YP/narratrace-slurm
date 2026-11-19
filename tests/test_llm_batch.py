@@ -169,6 +169,7 @@ def test_job_answers_saves_and_summarises(tmp_path, fake_vllm):
     assert summary["cuda"] == "13.0" and len(summary["prompts_sha256"]) == 64
     # it fell back from the video limit the model refused to the image limit
     assert LLM.made[-1]["limit_mm_per_prompt"] == {"image": 0}
+    assert LLM.made[-1]["max_num_seqs"] == 128  # vLLM's 256 is too many for Qwen3.8 on an L40
 
 
 def test_job_carries_on_where_it_stopped(tmp_path, fake_vllm):
