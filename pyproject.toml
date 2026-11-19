@@ -1,0 +1,20 @@
+[project]
+name = "narratrace-slurm"
+version = "0.1.0"
+description = "The fixed SLURM jobs NarraTrace runs on Blythe, the University of Warwick's GPU cluster"
+requires-python = ">=3.12,<3.13"
+# Nothing here is needed on Blythe: jobs/setup_env.sbatch installs vLLM there.
+dependencies = []
+
+[dependency-groups]
+dev = ["pytest>=8", "ruff>=0.8"]
+
+[tool.pytest.ini_options]
+pythonpath = ["."]
+testpaths = ["tests"]
+
+[tool.ruff]
+line-length = 100
+
+[tool.ruff.lint]
+select = ["E4", "E7", "E9", "F", "I"]

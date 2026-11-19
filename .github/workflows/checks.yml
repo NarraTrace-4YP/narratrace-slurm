@@ -1,0 +1,27 @@
+name: Checks
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+jobs:
+  python:
+    name: Tests and lint
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v5
+      - uses: astral-sh/setup-uv@v6
+      - run: uv sync --locked
+      - run: uv run ruff format --check .
+      - run: uv run ruff check .
+      - run: uv run pytest
+
+  jobs:
+    name: Job files are valid shell
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v5
+      - run: |
+          for f in jobs/*.sbatch; do bash -n "$f"; done
+          shellcheck --severity=warning jobs/*.sbatch
