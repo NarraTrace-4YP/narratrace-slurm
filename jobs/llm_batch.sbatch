@@ -43,6 +43,9 @@ nvidia-smi --query-gpu=name,driver_version,memory.total --format=csv,noheader
 export HF_HUB_OFFLINE=1 TRANSFORMERS_OFFLINE=1
 export HF_HOME="$NARRATRACE/hf-home" VLLM_CACHE_ROOT="$NARRATRACE/vllm-cache"
 export VLLM_NO_USAGE_STATS=1 DO_NOT_TRACK=1
+# Compiler caches (Triton, FlashInfer, ...) go to the project share, not the small home folder.
+export XDG_CACHE_HOME="$NARRATRACE/cache" TRITON_HOME="$NARRATRACE/cache"
+export FLASHINFER_WORKSPACE_BASE="$NARRATRACE/cache"
 
 # Which version of this repository answered, stored in output/summary.json ("-dirty" if
 # the clone on Blythe has changes that aren't committed).

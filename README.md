@@ -38,28 +38,46 @@ the answers, so every result can be traced to the code that produced it.
 
 ## On Blythe
 
+Home folders on Blythe are small: 2 GB and 100,000 files (`mmlsquota --block-size auto`).
+Project work belongs in the shared directory, which is on SSDs. For NarraTrace that is
+`/springbrook/share/dcsug/csujxb/narratrace`. Other users of the `dcsug` share can see it,
+so it is kept private (`chmod 700`). The Python environment in it runs under Rowan's
+account, so nobody else may be able to change it. The big folders live there and are linked
+from `~/narratrace`, so the job files and Windmill only ever use `~/narratrace/...`:
+
 ```text
 ~/narratrace/
   slurm/                     a clone of this repository
   jobs -> slurm/jobs         the job files Windmill may submit
-  env/                       Python 3.12 with vLLM, made by setup_env.sbatch
-  models/<org>/<name>/       the model, at a fixed commit (NARRATRACE_REVISION)
-  runs/<run_id>/             one folder per run, made by Windmill:
+  runs/<run_id>/             one folder per run, made by Windmill (small, so kept in home):
     input/                   request.json and prompts.jsonl.gz
     output/                  results.jsonl.gz and summary.json, written by the job
     slurm-<job>.out          the job's log
     callback_url             the one-time Windmill address the job calls when it ends
+  env -> share               Python 3.12 with vLLM, made by setup_env.sbatch
+  models -> share            the model, at a fixed commit (NARRATRACE_REVISION)
+  hf-home, uv-cache, vllm-cache, python, cache -> share
+                             Hugging Face, uv and compiler caches, and uv's own Python
 ```
 
 Setting it up (Rowan):
 
-1. `git clone https://github.com/NarraTrace-4YP/narratrace-slurm.git ~/narratrace/slurm`
-2. Point the jobs folder at the clone:
-   `mv ~/narratrace/jobs ~/narratrace/jobs.old && ln -s ~/narratrace/slurm/jobs ~/narratrace/jobs`
-3. `cd ~/narratrace && sbatch jobs/setup_env.sbatch`, and check `setup-<job>.out` when it
-   finishes.
-4. From Windmill, run `u/rshields2004/blythe_run_job` with `test_gpu`. The driver it reports
-   must be 580 or newer for vLLM 0.34's CUDA 13.
+```sh
+git clone https://github.com/NarraTrace-4YP/narratrace-slurm.git ~/narratrace/slurm
+ln -s ~/narratrace/slurm/jobs ~/narratrace/jobs
+
+STORE=/springbrook/share/dcsug/csujxb/narratrace
+mkdir -p "$STORE" && chmod 700 /springbrook/share/dcsug/csujxb "$STORE"
+cd ~/narratrace
+for d in env models hf-home uv-cache vllm-cache python cache; do
+  mkdir -p "$STORE/$d" && ln -sfn "$STORE/$d" "$d"
+done
+sbatch jobs/setup_env.sbatch       # then check setup-<job>.out
+```
+
+`setup_env.sbatch` refuses to start if any of those folders isn't a link, so it can't fill
+the home folder by mistake. Then, from Windmill, run `u/rshields2004/blythe_run_job` with
+`test_gpu`: the driver it reports must be 580 or newer for vLLM 0.34's CUDA 13.
 
 To update later: `cd ~/narratrace/slurm && git pull`. Pull only from `main`, so what runs
 on Blythe is what was reviewed.

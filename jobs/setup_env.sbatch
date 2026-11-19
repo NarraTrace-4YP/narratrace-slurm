@@ -25,14 +25,24 @@ UV_VERSION=0.11.32
 VLLM_VERSION=0.34.0
 MODEL="${1:-Qwen/Qwen3.8-27B-FP8}"
 
+# Blythe's home folders are small (2 GB, 100,000 files), so everything big lives in the
+# project share and is linked from ~/narratrace (see README): env, models, hf-home,
+# uv-cache, vllm-cache, python (uv's own Python 3.12) and cache (compiler caches).
+for d in env models hf-home uv-cache vllm-cache python cache; do
+  if [ ! -L "$NARRATRACE/$d" ]; then
+    echo "$NARRATRACE/$d isn't a link to the project share. Set it up first (see README)." >&2
+    exit 1
+  fi
+done
 export HF_HOME="$NARRATRACE/hf-home"
 export UV_CACHE_DIR="$NARRATRACE/uv-cache" UV_LINK_MODE=copy
+export UV_PYTHON_INSTALL_DIR="$NARRATRACE/python" XDG_CACHE_HOME="$NARRATRACE/cache"
 export PATH="$HOME/.local/bin:$PATH"
 
 echo "Setting up $NARRATRACE on $(hostname), $(date -Is)"
-echo "Space in your home folder:"
-df -h "$HOME" | tail -n 1
-quota -s 2>/dev/null || true
+echo "Space (home, then the share):"
+mmlsquota --block-size auto 2>/dev/null || true
+df -h "$(readlink -f "$NARRATRACE/env")" | tail -n 1
 
 if ! uv --version 2>/dev/null | grep -q "^uv $UV_VERSION"; then
   echo "Installing uv $UV_VERSION into ~/.local/bin"
@@ -70,4 +80,4 @@ PY
 
 uv cache clean >/dev/null 2>&1 || true
 echo "Done, $(date -Is). Space now:"
-df -h "$HOME" | tail -n 1
+mmlsquota --block-size auto 2>/dev/null || true
