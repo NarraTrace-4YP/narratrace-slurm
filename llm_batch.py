@@ -215,6 +215,19 @@ def gpu_details() -> dict:
 # ---------------------------------------------------------------- running the model
 
 
+# vLLM runs the model in a child process. Started by "fork", that child can't use CUDA once the
+# parent has touched it (as a failed first attempt below can), and the job fails with "Cannot
+# re-initialize CUDA in forked subprocess", hiding the real error. "spawn" starts it clean.
+os.environ.setdefault("VLLM_WORKER_MULTIPROC_METHOD", "spawn")
+
+
+def _modality_refused(error: Exception) -> bool:
+    """Whether vLLM refused limit_mm_per_prompt itself (an older vLLM, or a model without that
+    modality), rather than failing for some other reason, which must not be retried."""
+    text = str(error).lower()
+    return "limit_mm_per_prompt" in text or "modalit" in text
+
+
 def load_model(model_dir: Path, request: dict):
     from vllm import LLM
 
@@ -234,7 +247,7 @@ def load_model(model_dir: Path, request: dict):
                 return LLM(**settings)
             return LLM(**settings, limit_mm_per_prompt=limits)
         except (TypeError, ValueError) as error:
-            if limits is None:
+            if limits is None or not _modality_refused(error):
                 raise
             log(f"vLLM didn't take limit_mm_per_prompt={limits} ({error}); trying without")
 

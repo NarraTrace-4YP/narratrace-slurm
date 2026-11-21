@@ -7,6 +7,7 @@ probabilities here; the real model is checked by running the pilot on Blythe.
 import gzip
 import json
 import math
+import os
 import sys
 import types
 
@@ -202,3 +203,15 @@ def test_prompts_need_unique_ids(tmp_path):
             f.write(json.dumps({"id": "same", "messages": [], "labels": ["A"]}) + "\n")
     with pytest.raises(ValueError, match="twice"):
         llm_batch.read_prompts(path)
+
+
+def test_only_a_refused_modality_is_retried(tmp_path, fake_vllm, monkeypatch):
+    class Broken:
+        def __init__(self, **settings):
+            raise ValueError("Free memory on device is less than desired GPU memory utilization")
+
+    monkeypatch.setattr(sys.modules["vllm"], "LLM", Broken)
+    request = {**llm_batch.DEFAULTS, "model": "m"}
+    with pytest.raises(ValueError, match="Free memory"):
+        llm_batch.load_model(tmp_path, request)  # raised at once: not hidden by a retry
+    assert os.environ["VLLM_WORKER_MULTIPROC_METHOD"] == "spawn"
