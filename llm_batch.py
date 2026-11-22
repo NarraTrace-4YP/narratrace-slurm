@@ -1,4 +1,5 @@
-"""Answer a batch of multiple-choice prompts with an LLM, offline with vLLM, on one GPU.
+"""Answer a batch of multiple-choice prompts with an LLM, offline with vLLM, on one GPU (or several,
+split with "engine": {"tensor_parallel_size": n} when the job was given n GPUs).
 
 The llm_batch.sbatch job runs this on a Blythe GPU node, inside the run folder Windmill made:
 
@@ -11,7 +12,9 @@ input/request.json says how to run the model:
      "chunk_size": 512,                # prompts per vLLM call; results are saved after each
      "gpu_memory_utilization": 0.9,
      "max_num_seqs": 128,              # prompts worked on at once (see DEFAULTS)
-     "seed": 0}
+     "seed": 0,
+     "engine": {"tensor_parallel_size": 2},  # optional: more vLLM settings (ENGINE_SETTINGS)
+     "env": {"VLLM_PLE_CPU_OFFLOAD": "1"}}   # optional: vLLM switches (ENV_SETTINGS)
 input/prompts.jsonl.gz holds one prompt per line:
     {"id": "...", "messages": [{"role": "system" | "user", "content": "..."}, ...],
      "labels": ["A", "B", ..., "Z"], "meta": {...}}
@@ -64,6 +67,22 @@ DEFAULTS = {
     "max_num_seqs": 128,
     "seed": 0,
 }
+# Settings a model trial may add under "engine" in request.json, passed to vllm.LLM as they are.
+# Anything else is refused, so a request can't change what the job does beyond running the model.
+ENGINE_SETTINGS = {
+    "tensor_parallel_size",    # split each layer over this many GPUs (the job must ask for them)
+    "enable_expert_parallel",  # mixture-of-experts models: spread the experts over the GPUs
+    "quantization",            # e.g. "awq", "compressed-tensors"; normally read from the model
+    "kv_cache_dtype",          # e.g. "fp8" to fit more prompts at once
+    "enforce_eager",           # skip CUDA graphs (slower, but avoids some start-up failures)
+    "compilation_config",      # e.g. {"mode": 0} to skip torch.compile
+    "cpu_offload_gb",          # keep this many GB of weights in the node's memory, not the GPU
+    "trust_remote_code",       # run Python code shipped with the model (only for models you trust)
+    "dtype",
+}
+# Environment switches a request may set under "env" before vLLM starts (names must start
+# with VLLM_; values are strings).
+ENV_PREFIX = "VLLM_"
 THINK_OPEN, THINK_CLOSE = "<think>", "</think>"
 
 
@@ -228,6 +247,28 @@ def _modality_refused(error: Exception) -> bool:
     return "limit_mm_per_prompt" in text or "modalit" in text
 
 
+def engine_settings(request: dict) -> dict:
+    """The extra vLLM settings in request["engine"], refusing any not in ENGINE_SETTINGS."""
+    engine = request.get("engine") or {}
+    unknown = sorted(set(engine) - ENGINE_SETTINGS)
+    if unknown:
+        raise ValueError(f"request.json engine settings not allowed: {', '.join(unknown)}")
+    return dict(engine)
+
+
+def set_env(request: dict) -> dict:
+    """Sets request["env"] (VLLM_* switches only) before vLLM is imported; returns what it set."""
+    env = request.get("env") or {}
+    for name, value in env.items():
+        if not name.startswith(ENV_PREFIX) or not name.replace("_", "").isalnum():
+            raise ValueError(f"request.json env may only set VLLM_* switches, not {name!r}")
+        if not isinstance(value, (str, int, float, bool)):
+            raise ValueError(f"request.json env {name} must be a plain value")
+    for name, value in env.items():
+        os.environ[name] = str(int(value) if isinstance(value, bool) else value)
+    return dict(env)
+
+
 def load_model(model_dir: Path, request: dict):
     from vllm import LLM
 
@@ -238,6 +279,7 @@ def load_model(model_dir: Path, request: dict):
         max_num_seqs=request["max_num_seqs"],
         seed=request["seed"],
         max_logprobs=max(20, request["top_logprobs"]),
+        **engine_settings(request),
     )
     # The prompts are text only: tell a vision-language model to reserve no memory for
     # images or video. Older vLLM versions or text-only models may reject a modality.
@@ -314,6 +356,12 @@ def main(argv: list[str] | None = None) -> int:
 
     started = time.time()
     request = {**DEFAULTS, **json.loads((args.input / "request.json").read_text())}
+    try:
+        engine_settings(request)
+        set_env(request)
+    except ValueError as error:
+        log(f"ERROR {error}")
+        return 2
     model_dir = args.models / request["model"]
     if not (model_dir / "config.json").exists():
         log(f"ERROR {request['model']} isn't downloaded to {model_dir}: run setup_env.sbatch")

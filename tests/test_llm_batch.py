@@ -215,3 +215,20 @@ def test_only_a_refused_modality_is_retried(tmp_path, fake_vllm, monkeypatch):
     with pytest.raises(ValueError, match="Free memory"):
         llm_batch.load_model(tmp_path, request)  # raised at once: not hidden by a retry
     assert os.environ["VLLM_WORKER_MULTIPROC_METHOD"] == "spawn"
+
+
+def test_engine_settings_pass_allowed_ones_and_refuse_others():
+    request = {"engine": {"tensor_parallel_size": 2, "enable_expert_parallel": True}}
+    assert llm_batch.engine_settings(request) == request["engine"]
+    assert llm_batch.engine_settings({}) == {}
+    with pytest.raises(ValueError, match="download_dir"):
+        llm_batch.engine_settings({"engine": {"download_dir": "/tmp"}})
+
+
+def test_env_sets_only_vllm_switches(monkeypatch):
+    monkeypatch.delenv("VLLM_PLE_CPU_OFFLOAD", raising=False)
+    assert llm_batch.set_env({"env": {"VLLM_PLE_CPU_OFFLOAD": True}})
+    assert os.environ["VLLM_PLE_CPU_OFFLOAD"] == "1"
+    for bad in ({"PATH": "/x"}, {"VLLM_X;rm": "1"}, {"VLLM_X": ["1"]}):
+        with pytest.raises(ValueError):
+            llm_batch.set_env({"env": bad})

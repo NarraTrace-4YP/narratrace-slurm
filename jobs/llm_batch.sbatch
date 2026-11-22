@@ -10,11 +10,13 @@
 #SBATCH --time=24:00:00
 #SBATCH --output=slurm-%j.out
 
-# Answers a batch of multiple-choice prompts with an LLM (vLLM, one L40 GPU).
+# Answers a batch of multiple-choice prompts with an LLM (vLLM, one L40 GPU unless Windmill
+# asks for more: a model trial can add --gres, --cpus-per-task and --mem-per-cpu).
 # sea004 is left out: on 20 Nov 2026 two jobs failed there while starting the model, where
 # every other L40 node had worked (remove the --exclude line once it is known to be fixed).
 # Windmill runs it from a run folder, sometimes with a shorter or longer time limit:
-#   sbatch --chdir ~/narratrace/runs/<run> [--time=HH:MM:SS] ~/narratrace/jobs/llm_batch.sbatch
+#   sbatch --chdir ~/narratrace/runs/<run> [--time=HH:MM:SS] [--gres=gpu:lovelace_l40:2 ...] \
+#     ~/narratrace/jobs/llm_batch.sbatch
 # Reads input/request.json and input/prompts.jsonl.gz; writes output/results.jsonl.gz and
 # output/summary.json (see ~/narratrace/slurm/llm_batch.py).
 # When it ends, even after an error, it wakes the Windmill run using the address in
