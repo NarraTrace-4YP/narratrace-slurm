@@ -27,6 +27,7 @@ It never sends commands of its own. The job names Windmill may submit are listed
 | `jobs/setup_env.sbatch` | Installs uv, Python 3.12 and vLLM 0.34.0 into `~/narratrace/env`, and downloads the model at a fixed commit. Needs no GPU. Run it by hand once, and again after changing a version. |
 | `jobs/test_gpu.sbatch` | Ten minutes on one L40. It reports the GPU and its driver, then calls Windmill back. |
 | `jobs/llm_batch.sbatch` | Answers a batch of one-letter prompts with vLLM on one L40 (`llm_batch.py`; its docstring describes the input and output files). |
+| `jobs/llm_serve.sbatch` | Keeps a model loaded on one L40 and answers prompts that Windmill adds while it runs (`llm_serve.py`; see "Adding prompts to a running job" below). |
 
 Each job's last step POSTs to the address in its run folder's `callback_url` (up to six
 tries, 20 s apart). This wakes the waiting Windmill run. Windmill then asks SLURM whether
@@ -35,6 +36,42 @@ the job has really ended, so a lost or early call does no harm.
 `llm_batch` records this repository's commit in `output/summary.json` (`code_commit`,
 ending in `-dirty` if the clone has uncommitted changes). The platform stores that file with
 the answers, so every result can be traced to the code that produced it.
+
+## Adding prompts to a running job
+
+`llm_batch` is given all its prompts at the start. `llm_serve` loads the model once and then
+answers prompts as Windmill adds them, so more work doesn't mean waiting in the SLURM queue
+or loading the model again. Its run folder works as a mailbox:
+
+```text
+runs/<run_id>/
+  input/request.json          the model and its settings, fixed for the whole job, plus
+                              idle_minutes (default 20) and poll_seconds (default 5)
+  inbox/<request>.callback    optional: an https address to call once the request is answered
+  inbox/<request>.jsonl.gz    the prompts, in llm_batch's format (Windmill writes each file
+                              under a hidden name and renames it, so it is never read half-written)
+  outbox/<request>.jsonl.gz   the answers, in llm_batch's results format
+  outbox/<request>.json       the request's summary, written last: the request is done
+  outbox/<request>.error.json instead, when the file wasn't a valid request
+  status.json                 what the job is doing now: loading, waiting, answering, stopped
+  output/requests.jsonl       one line per finished request
+  output/summary.json         at the end: versions, totals and why it stopped
+  stop                        made by Windmill to ask the job to stop
+```
+
+A request is data only. The job checks every prompt (chat messages with a short list of
+labels) and refuses a file that isn't one; nothing in a request can choose the model, a
+file or a command. Requests are answered one at a time, oldest first.
+
+The job stops when it is asked to (after answering what is already in `inbox/`), when
+nothing has arrived for `idle_minutes` (so it doesn't hold a shared GPU doing nothing), or
+15 minutes before its time limit, when SLURM sends it `USR1`: it finishes the chunk it is on
+and leaves the rest in `inbox/`. If SLURM requeues it in the same folder, it carries on
+where it stopped.
+
+Each new Windmill login needs a new 2FA code, so adding prompts this way suits batches of
+work, not one question at a time. Every request leaves two small files in `outbox/`, and
+run folders live in the home folder (100,000 files at most), so send prompts in batches.
 
 ## On Blythe
 
@@ -54,6 +91,7 @@ from `~/narratrace`, so the job files and Windmill only ever use `~/narratrace/.
     output/                  results.jsonl.gz and summary.json, written by the job
     slurm-<job>.out          the job's log
     callback_url             the one-time Windmill address the job calls when it ends
+    inbox/, outbox/, status.json   llm_serve's mailbox (see above)
   env -> share               Python 3.12 with vLLM, made by setup_env.sbatch
   models -> share            the model, at a fixed commit (NARRATRACE_REVISION)
   hf-home, uv-cache, vllm-cache, python, cache -> share

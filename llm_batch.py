@@ -70,14 +70,14 @@ DEFAULTS = {
 # Settings a model trial may add under "engine" in request.json, passed to vllm.LLM as they are.
 # Anything else is refused, so a request can't change what the job does beyond running the model.
 ENGINE_SETTINGS = {
-    "tensor_parallel_size",    # split each layer over this many GPUs (the job must ask for them)
+    "tensor_parallel_size",  # split each layer over this many GPUs (the job must ask for them)
     "enable_expert_parallel",  # mixture-of-experts models: spread the experts over the GPUs
-    "quantization",            # e.g. "awq", "compressed-tensors"; normally read from the model
-    "kv_cache_dtype",          # e.g. "fp8" to fit more prompts at once
-    "enforce_eager",           # skip CUDA graphs (slower, but avoids some start-up failures)
-    "compilation_config",      # e.g. {"mode": 0} to skip torch.compile
-    "cpu_offload_gb",          # keep this many GB of weights in the node's memory, not the GPU
-    "trust_remote_code",       # run Python code shipped with the model (only for models you trust)
+    "quantization",  # e.g. "awq", "compressed-tensors"; normally read from the model
+    "kv_cache_dtype",  # e.g. "fp8" to fit more prompts at once
+    "enforce_eager",  # skip CUDA graphs (slower, but avoids some start-up failures)
+    "compilation_config",  # e.g. {"mode": 0} to skip torch.compile
+    "cpu_offload_gb",  # keep this many GB of weights in the node's memory, not the GPU
+    "trust_remote_code",  # run Python code shipped with the model (only for models you trust)
     "dtype",
 }
 # Environment switches a request may set under "env" before vLLM starts (names must start
