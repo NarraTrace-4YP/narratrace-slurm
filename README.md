@@ -6,14 +6,16 @@ O1 stage 5, `f/dhr/O1/choose_template_section`, which runs an LLM to map each re
 its statutory template.
 
 This repository is kept apart from the platform because it is what runs on Blythe, under
-Rowan's university account. Its clone on Blythe changes only when Rowan pulls it there. The
-platform's Windmill code changes separately.
+each team member's own university account. Each person has their own clone on Blythe, which
+changes only when they pull it there. The platform's Windmill code changes separately.
 
 ## How Windmill uses it
 
-Windmill logs in over SSH with Rowan's key and a 2FA code made from his 2FA secret. SCRTP
-allowed this on 19 Nov 2026, until they offer a web interface. Only Rowan's Windmill runs can
-do this (`check_owner()` in the platform's `f/dhr/blythe.py`). Windmill can only:
+Each Windmill run logs in over SSH as the person who started it, with their own key and a 2FA
+code made from their own 2FA secret, which they keep as their own Windmill variables (the
+platform's `f/dhr/README.md` lists them). SCRTP allowed this for Rowan's account on 19 Nov
+2026, until they offer a web interface; anyone else needs the same agreement for their own
+account first. Windmill can only:
 
 - upload a run's input files into a new run folder,
 - submit one of the job files in `jobs/` by name, with a time limit,
@@ -27,7 +29,7 @@ It never sends commands of its own. The job names Windmill may submit are listed
 | `jobs/setup_env.sbatch` | Installs uv, Python 3.12 and vLLM 0.34.0 into `~/narratrace/env`, and downloads the model at a fixed commit. Needs no GPU. Run it by hand once, and again after changing a version. |
 | `jobs/test_gpu.sbatch` | Ten minutes on one L40. It reports the GPU and its driver, then calls Windmill back. |
 | `jobs/llm_batch.sbatch` | Answers a batch of one-letter prompts with vLLM on one L40 (`llm_batch.py`; its docstring describes the input and output files). |
-| `jobs/llm_serve.sbatch` | Keeps a model loaded on one L40 and answers prompts that Windmill adds while it runs (`llm_serve.py`; see "Adding prompts to a running job" below). |
+| `jobs/llm_serve.sbatch` | Keeps a model loaded on one L40 and answers prompts that Windmill adds while it runs, with a label or with written text, JSON or tool calls (`llm_serve.py`; see "Adding prompts to a running job" below). The platform's LLM gateway uses it. |
 
 Each job's last step POSTs to the address in its run folder's `callback_url` (up to six
 tries, 20 s apart). This wakes the waiting Windmill run. Windmill then asks SLURM whether
@@ -46,22 +48,31 @@ or loading the model again. Its run folder works as a mailbox:
 ```text
 runs/<run_id>/
   input/request.json          the model and its settings, fixed for the whole job, plus
-                              idle_minutes (default 20) and poll_seconds (default 5)
+                              idle_minutes (default 20) and poll_seconds (default 1)
   inbox/<request>.callback    optional: an https address to call once the request is answered
-  inbox/<request>.jsonl.gz    the prompts, in llm_batch's format (Windmill writes each file
-                              under a hidden name and renames it, so it is never read half-written)
-  outbox/<request>.jsonl.gz   the answers, in llm_batch's results format
+  inbox/<request>.jsonl.gz    the prompts (Windmill writes each file under a hidden name and
+                              renames it, so it is never read half-written)
+  outbox/<request>.jsonl.gz   the answers
   outbox/<request>.json       the request's summary, written last: the request is done
   outbox/<request>.error.json instead, when the file wasn't a valid request
   status.json                 what the job is doing now: loading, waiting, answering, stopped
+  events.log                  one line per finished request, for whoever is waiting
   output/requests.jsonl       one line per finished request
   output/summary.json         at the end: versions, totals and why it stopped
   stop                        made by Windmill to ask the job to stop
 ```
 
-A request is data only. The job checks every prompt (chat messages with a short list of
-labels) and refuses a file that isn't one; nothing in a request can choose the model, a
-file or a command. Requests are answered one at a time, oldest first.
+A prompt is one of two kinds. A label prompt (`"labels": [...]`, llm_batch's format) is
+answered with one label and each label's probability. A generation prompt (`"generate":
+{...}`) is answered with written text: it may set `max_tokens`, `temperature`, `top_p`,
+`stop`, `seed`, a `json_schema` the answer must match, and `thinking`; it may list `tools`
+(OpenAI's format), which the chat template shows the model, and its calls come back in the
+text as Qwen's `<tool_call>` blocks. `llm_serve.py`'s docstring has the details.
+
+A request is data only. The job checks every prompt against fixed limits and refuses a file
+that isn't valid; nothing in a request can choose the model, a file or a command, and tools
+are only descriptions for the model to read (the job never runs them). Requests are
+answered one at a time, oldest first.
 
 The job stops when it is asked to (after answering what is already in `inbox/`), when
 nothing has arrived for `idle_minutes` (so it doesn't hold a shared GPU doing nothing), or
@@ -69,17 +80,19 @@ nothing has arrived for `idle_minutes` (so it doesn't hold a shared GPU doing no
 and leaves the rest in `inbox/`. If SLURM requeues it in the same folder, it carries on
 where it stopped.
 
-Each new Windmill login needs a new 2FA code, so adding prompts this way suits batches of
-work, not one question at a time. Every request leaves two small files in `outbox/`, and
+Each new Windmill login needs a new 2FA code, so adding prompts from separate Windmill runs
+suits batches of work. The platform's LLM gateway instead keeps one login open per person,
+which makes one question at a time practical too. Every request leaves two small files in `outbox/`, and
 run folders live in the home folder (100,000 files at most), so send prompts in batches.
 
 ## On Blythe
 
 Home folders on Blythe are small: 2 GB and 100,000 files (`mmlsquota --block-size auto`).
-Project work belongs in the shared directory, which is on SSDs. For NarraTrace that is
-`/springbrook/share/dcsug/csujxb/narratrace`. Other users of the `dcsug` share can see it,
-so it is kept private (`chmod 700`). The Python environment in it runs under Rowan's
-account, so nobody else may be able to change it. The big folders live there and are linked
+Project work belongs in your shared directory, which is on SSDs. For Rowan that is
+`/springbrook/share/dcsug/csujxb/narratrace` (yours is likely the same with your own
+username; check that the folder above it exists). Other users of the share can see it, so it
+is kept private (`chmod 700`). The Python environment in it runs under your account, so
+nobody else may be able to change it. The big folders live there and are linked
 from `~/narratrace`, so the job files and Windmill only ever use `~/narratrace/...`:
 
 ```text
@@ -98,14 +111,14 @@ from `~/narratrace`, so the job files and Windmill only ever use `~/narratrace/.
                              Hugging Face, uv and compiler caches, and uv's own Python
 ```
 
-Setting it up (Rowan):
+Setting it up, once per person, logged in to Blythe as yourself:
 
 ```sh
 git clone https://github.com/NarraTrace-4YP/narratrace-slurm.git ~/narratrace/slurm
 ln -s ~/narratrace/slurm/jobs ~/narratrace/jobs
 
-STORE=/springbrook/share/dcsug/csujxb/narratrace
-mkdir -p "$STORE" && chmod 700 /springbrook/share/dcsug/csujxb "$STORE"
+STORE=/springbrook/share/dcsug/$USER/narratrace   # your own share folder
+mkdir -p "$STORE" && chmod 700 "$(dirname "$STORE")" "$STORE"
 cd ~/narratrace
 for d in env models hf-home uv-cache vllm-cache python cache; do
   mkdir -p "$STORE/$d" && ln -sfn "$STORE/$d" "$d"
@@ -114,8 +127,9 @@ sbatch jobs/setup_env.sbatch       # then check setup-<job>.out
 ```
 
 `setup_env.sbatch` refuses to start if any of those folders isn't a link, so it can't fill
-the home folder by mistake. Then, from Windmill, run `u/rshields2004/blythe_run_job` with
-`test_gpu`: the driver it reports must be 580 or newer for vLLM 0.34's CUDA 13.
+the home folder by mistake. It downloads vLLM and the model (about 30 GB) into your share.
+Then check it from Windmill, logged in as yourself: `f/dhr/tools/llm_server` with action
+`start` and a test prompt (see the platform's `f/dhr/README.md`).
 
 To update later: `cd ~/narratrace/slurm && git pull`. Pull only from `main`, so what runs
 on Blythe is what was reviewed.

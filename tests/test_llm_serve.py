@@ -10,6 +10,7 @@ import http.server
 import json
 import os
 import threading
+from types import SimpleNamespace
 
 import pytest
 from test_llm_batch import LLM
@@ -295,3 +296,279 @@ def test_a_model_that_fails_to_load_says_so_in_the_status(tmp_path, fake_vllm, m
         serve(models, run)
     status = json.loads((run / "status.json").read_text())
     assert status["state"] == "failed" and "Free memory" in status["error"]
+
+
+# ---------------------------------------------------------------- generation prompts
+
+
+class Params:
+    """Stands in for vllm.SamplingParams: keeps whatever it is given."""
+
+    def __init__(self, **settings):
+        self.__dict__.update(settings)
+
+
+class Structured:
+    def __init__(self, json):
+        self.json = json
+
+
+class TextTokenizer:
+    def get_vocab(self):
+        return {"<think>": 0, "</think>": 1, "A": 2, "B": 3, "Z": 4}
+
+    def apply_chat_template(
+        self, messages, tokenize, add_generation_prompt, enable_thinking, tools=None
+    ):
+        text = " ".join(m.get("content") or "" for m in messages)
+        if tools:
+            text += " tools: " + " ".join(t["function"]["name"] for t in tools)
+        return text + (" <think>\n" if enable_thinking else "\n")
+
+    def __call__(self, text, add_special_tokens):
+        return {"input_ids": text.split()}
+
+    def decode(self, ids):
+        return "?"
+
+
+class TextLLM:
+    """A stand-in model that writes predictable answers: JSON under a schema, a tool call when
+    it was shown tools, a thinking block when thinking is on, and an echo otherwise. A prompt
+    mentioning "refuse" makes the whole batch fail, as vLLM does with a schema it can't use."""
+
+    made = []
+
+    def __init__(self, **settings):
+        TextLLM.made.append(settings)
+
+    def get_tokenizer(self):
+        return TextTokenizer()
+
+    def generate(self, prompts, params, use_tqdm):
+        if not isinstance(params, list):
+            params = [params] * len(prompts)
+        outputs = []
+        for prompt, p in zip(prompts, params, strict=True):
+            words = prompt["prompt_token_ids"]
+            if p.max_tokens == 1:  # a label prompt, as llm_batch asks
+                first = {3: Logprob(0.9, "B")} if "timescales" in words else {4: Logprob(0.8, "Z")}
+                outputs.append(SimpleNamespace(outputs=[SimpleNamespace(logprobs=[first])]))
+                continue
+            if "refuse" in words:
+                raise ValueError("this schema can't be followed")
+            if getattr(p, "structured_outputs", None):
+                text = json.dumps({"ok": True, "schema_keys": sorted(p.structured_outputs.json)})
+            elif "tools:" in words:
+                text = '<tool_call>\n{"name": "lookup", "arguments": {"q": "x"}}\n</tool_call>'
+            elif words[-1] == "<think>":
+                text = "<think>\nweighing it up\n</think>\n\nThe answer."
+            else:
+                said = [w for w in words if w not in ("<think>", "</think>")]
+                text = "echo " + " ".join(said[:3])
+            text = " ".join(text.split(" ")[: p.max_tokens]) if p.max_tokens < 5 else text
+            outputs.append(
+                SimpleNamespace(
+                    outputs=[
+                        SimpleNamespace(
+                            text=text,
+                            finish_reason="length" if p.max_tokens < 5 else "stop",
+                            token_ids=list(range(len(text.split()))),
+                        )
+                    ]
+                )
+            )
+        return outputs
+
+
+class Logprob:
+    def __init__(self, probability, token):
+        import math
+
+        self.logprob, self.decoded_token = math.log(probability), token
+
+
+@pytest.fixture
+def text_vllm(monkeypatch):
+    import sys
+    import types
+
+    vllm = types.ModuleType("vllm")
+    vllm.LLM, vllm.SamplingParams, vllm.__version__ = TextLLM, Params, "0.34.0"
+    sampling = types.ModuleType("vllm.sampling_params")
+    sampling.StructuredOutputsParams = Structured
+    torch = types.ModuleType("torch")
+    torch.__version__, torch.version = "2.14.0+cu130", types.SimpleNamespace(cuda="13.0")
+    monkeypatch.setitem(sys.modules, "vllm", vllm)
+    monkeypatch.setitem(sys.modules, "vllm.sampling_params", sampling)
+    monkeypatch.setitem(sys.modules, "torch", torch)
+    TextLLM.made = []
+
+
+def add_raw_request(run, request_id, prompts):
+    inbox = run / "inbox"
+    inbox.mkdir(exist_ok=True)
+    temporary = inbox / f".{request_id}.jsonl.gz.tmp"
+    with gzip.open(temporary, "wt") as f:
+        for prompt in prompts:
+            f.write(json.dumps(prompt) + "\n")
+    temporary.replace(inbox / f"{request_id}.jsonl.gz")
+
+
+def user(text):
+    return [{"role": "user", "content": text}]
+
+
+def test_generation_prompts_get_written_answers(tmp_path, text_vllm, monkeypatch):
+    models, run = make_run(tmp_path)
+    Clock(monkeypatch)
+    tool = {"type": "function", "function": {"name": "lookup", "parameters": {"type": "object"}}}
+    history = [
+        {"role": "user", "content": "find x"},
+        {
+            "role": "assistant",
+            "content": None,
+            "tool_calls": [
+                {"id": "c1", "type": "function", "function": {"name": "lookup", "arguments": "{}"}}
+            ],
+        },
+        {"role": "tool", "tool_call_id": "c1", "content": "nothing found"},
+    ]
+    add_raw_request(
+        run,
+        "mixed",
+        [
+            {"id": "label", "messages": user("about timescales"), "labels": ["A", "B"]},
+            {"id": "plain", "messages": user("hello there model"), "generate": {}},
+            {
+                "id": "json",
+                "messages": user("give json"),
+                "generate": {"json_schema": {"type": "object", "properties": {}}},
+            },
+            {"id": "think", "messages": user("hard one"), "generate": {"thinking": True}},
+            {"id": "tool", "messages": history, "generate": {"max_tokens": 200}, "tools": [tool]},
+            {"id": "short", "messages": user("say a lot"), "generate": {"max_tokens": 2}},
+        ],
+    )
+    (run / "stop").touch()
+    assert serve(models, run) == 0
+    got = {r["id"]: r for r in answers(run, "mixed")}
+    assert [r["id"] for r in answers(run, "mixed")] == [
+        "label",
+        "plain",
+        "json",
+        "think",
+        "tool",
+        "short",
+    ]
+    assert got["label"]["answer"] == "B"
+    assert (
+        got["plain"]["text"] == "echo hello there model" and got["plain"]["finish_reason"] == "stop"
+    )
+    assert got["plain"]["completion_tokens"] == 4 and got["plain"]["prompt_tokens"] > 0
+    assert json.loads(got["json"]["text"]) == {"ok": True, "schema_keys": ["properties", "type"]}
+    assert got["think"]["reasoning"] == "weighing it up" and got["think"]["text"] == "The answer."
+    assert got["tool"]["text"].startswith("<tool_call>") and got["tool"]["error"] is None
+    assert got["short"]["finish_reason"] == "length"
+    done = json.loads((run / "outbox" / "mixed.json").read_text())
+    assert done["n_answered"] == 6 and done["completion_tokens_this_job"] > 0
+    events = [json.loads(line) for line in (run / "events.log").read_text().splitlines()]
+    assert [(e["request"], e["status"]) for e in events] == [("mixed", "answered")]
+    summary = json.loads((run / "output" / "summary.json").read_text())
+    assert summary["completion_tokens"] == done["completion_tokens_this_job"]
+
+
+def test_a_prompt_the_model_refuses_gets_an_error_and_the_rest_are_answered(
+    tmp_path, text_vllm, monkeypatch
+):
+    models, run = make_run(tmp_path, chunk_size=10)
+    Clock(monkeypatch)
+    add_raw_request(
+        run,
+        "r",
+        [
+            {"id": "a", "messages": user("first"), "generate": {}},
+            {"id": "b", "messages": user("please refuse"), "generate": {}},
+            {"id": "c", "messages": user("third"), "generate": {}},
+        ],
+    )
+    (run / "stop").touch()
+    assert serve(models, run) == 0
+    got = {r["id"]: r for r in answers(run, "r")}
+    assert got["a"]["text"] == "echo first" and got["c"]["text"] == "echo third"
+    assert got["b"]["text"] is None and "can't be followed" in got["b"]["error"]
+
+
+def test_a_prompt_longer_than_the_model_allows_is_reported(tmp_path, text_vllm, monkeypatch):
+    models, run = make_run(tmp_path, max_model_len=10)
+    Clock(monkeypatch)
+    add_raw_request(run, "r", [{"id": "long", "messages": user("word " * 20), "generate": {}}])
+    (run / "stop").touch()
+    assert serve(models, run) == 0
+    (got,) = answers(run, "r")
+    assert got["text"] is None and got["error"].startswith("prompt too long")
+
+
+def generation(**changes):
+    prompt = {"id": "g", "messages": user("hi"), "generate": {}}
+    prompt.update(changes)
+    return prompt
+
+
+@pytest.mark.parametrize(
+    "prompt",
+    [
+        generation(generate={"model": "other"}),
+        generation(generate={"max_tokens": 0}),
+        generation(generate={"max_tokens": 40000}),
+        generation(generate={"temperature": 3}),
+        generation(generate={"top_p": 0}),
+        generation(generate={"stop": ["x"] * 9}),
+        generation(generate={"seed": -1}),
+        generation(generate={"json_schema": "not an object"}),
+        generation(generate={"json_schema": {"type": "object"}, "thinking": True}),
+        generation(generate="max_tokens=5"),
+        generation(tools=[{"type": "function", "function": {"name": "rm -rf ~"}}]),
+        generation(tools=[{"type": "shell", "command": "ls"}]),
+        generation(tools="lookup"),
+        generation(model="other"),
+        generation(messages=[{"role": "system", "content": "x", "command": "ls"}]),
+        generation(messages=[{"role": "root", "content": "x"}]),
+        generation(messages=[{"role": "user", "content": None}]),
+        generation(messages=[{"role": "user", "content": "x", "tool_calls": []}]),
+        {"id": "g", "messages": user("hi"), "generate": {}, "labels": ["A"]},
+        {"id": "g", "messages": user("hi")},
+        {"id": "g", "messages": [{"role": "tool", "content": "x"}], "labels": ["A"]},
+    ],
+)
+def test_generation_requests_are_data_only(prompt):
+    with pytest.raises(ValueError):
+        check_prompts([prompt])
+
+
+def test_generation_settings_within_limits_pass():
+    check_prompts(
+        [
+            generation(
+                generate={
+                    "max_tokens": 4096,
+                    "temperature": 0.7,
+                    "top_p": 0.9,
+                    "stop": ["\n\n"],
+                    "seed": 7,
+                    "json_schema": {"type": "object"},
+                },
+                tools=[{"type": "function", "function": {"name": "lookup", "description": "d"}}],
+                meta={"page": "Police"},
+            )
+        ]
+    )
+
+
+def test_polling_can_be_quicker_than_a_second(tmp_path, text_vllm, monkeypatch):
+    models, run = make_run(tmp_path, poll_seconds=0.5, idle_minutes=1)
+    clock = Clock(monkeypatch)
+    assert serve(models, run) == 0
+    assert clock.t - 1_000_000.0 == 60
+    models, run = make_run(tmp_path / "again", poll_seconds=0.1)
+    assert serve(models, run) == 2
