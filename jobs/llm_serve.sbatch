@@ -14,7 +14,7 @@
 # Keeps a model loaded on one L40 and answers prompts as Windmill adds them to the run
 # folder's inbox/ (llm_serve.py describes the files). It stops when asked (a "stop" file),
 # after idle_minutes with nothing to do, or near its time limit: 15 minutes before it,
-# SLURM sends this script USR1, which is passed on so the server finishes the chunk it is on.
+# SLURM sends this script USR1, which is passed on so the server finishes what it has started.
 # Windmill runs it from a run folder, usually with a shorter time limit:
 #   sbatch --chdir ~/narratrace/runs/<run> [--time=HH:MM:SS] ~/narratrace/jobs/llm_serve.sbatch
 # Reads input/request.json; Windmill adds inbox/<request>.jsonl.gz files while it runs.

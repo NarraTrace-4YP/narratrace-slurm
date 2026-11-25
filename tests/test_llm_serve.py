@@ -2,7 +2,10 @@
 adds to its inbox while it runs.
 
 As in test_llm_batch.py, a stand-in vLLM answers here (B for prompts mentioning "timescales",
-else Z), and time is faked so the tests don't wait.
+else Z), and time is faked so the tests don't wait. The server drives vLLM's engine step by
+step (llm.llm_engine); StepEngine stands in for it, using the stand-in model's answers: a
+label prompt finishes after one step, a generation prompt after one step per 100 tokens
+it may write.
 """
 
 import gzip
@@ -18,6 +21,53 @@ from test_llm_batch import LLM
 import llm_batch
 import llm_serve
 from llm_serve import check_prompts, read_callback, waiting_requests
+
+
+class StepEngine:
+    """Stands in for vLLM's LLMEngine: add_request, step, abort_request."""
+
+    made = []
+    hooks: dict = {}  # step number -> something to do before that step (add a request...)
+
+    def __init__(self, llm):
+        self.llm, self.running, self.steps, self.most = llm, [], 0, 0
+        StepEngine.made.append(self)
+
+    def add_request(self, request_id, prompt, params):
+        # the answer is worked out now, so a prompt the model refuses fails here, as in vLLM
+        (output,) = self.llm.generate([prompt], params, use_tqdm=False)
+        output.request_id, output.finished = request_id, True
+        steps = 1 if params.max_tokens == 1 else max(1, -(-params.max_tokens // 100))
+        self.running.append([steps, output])
+        self.most = max(self.most, len(self.running))
+
+    def step(self):
+        self.steps += 1
+        hook = StepEngine.hooks.pop(self.steps, None)
+        if hook:
+            hook()
+        finished = []
+        for item in list(self.running):
+            item[0] -= 1
+            if item[0] == 0:
+                self.running.remove(item)
+                finished.append(item[1])
+        return finished
+
+    def abort_request(self, request_ids):
+        self.running = [item for item in self.running if item[1].request_id not in request_ids]
+
+
+@pytest.fixture(autouse=True)
+def step_engine(monkeypatch):
+    def engine(llm):
+        if not hasattr(llm, "_engine"):
+            llm._engine = StepEngine(llm)
+        return llm._engine
+
+    for model in (LLM, TextLLM):
+        monkeypatch.setattr(model, "llm_engine", property(engine), raising=False)
+    StepEngine.made, StepEngine.hooks = [], {}
 
 
 def make_run(tmp_path, **request):
@@ -129,33 +179,86 @@ def test_stops_by_itself_when_idle(tmp_path, fake_vllm, monkeypatch):
 
 
 def test_time_limit_warning_then_a_requeue_carries_on(tmp_path, fake_vllm, monkeypatch):
-    models, run = make_run(tmp_path)
+    models, run = make_run(tmp_path, max_num_seqs=2)  # three prompts in the engine at once
     Clock(monkeypatch)
     add_request(run, "big", ["about timescales"] * 5)
     add_request(run, "later", ["about nothing"])
-    real_answer_chunk = llm_serve.answer_chunk
-
-    def warned_after_first_chunk(*args):
-        llm_serve.stopping.set()  # as SIGUSR1 from SLURM would
-        return real_answer_chunk(*args)
-
-    monkeypatch.setattr(llm_serve, "answer_chunk", warned_after_first_chunk)
+    StepEngine.hooks[1] = llm_serve.stopping.set  # as SIGUSR1 from SLURM would
     assert serve(models, run) == 0
     summary = json.loads((run / "output" / "summary.json").read_text())
     assert summary["stopped_because"] == "time limit near"
-    assert summary["left_in_inbox"] == ["big", "later"]
+    # both requests were started together: "later" was finished, "big" saved part way
+    assert [r["answer"] for r in answers(run, "later")] == ["Z"]
+    assert summary["left_in_inbox"] == ["big"]
     partial = llm_batch.read_done(run / "outbox" / "big.partial.jsonl.gz")
-    assert len(partial) == 2  # the chunk it was on was finished and saved
+    assert len(partial) == 2  # the prompts it had started were finished and saved
 
     # SLURM requeues the job in the same folder: it answers only what is left
-    monkeypatch.setattr(llm_serve, "answer_chunk", real_answer_chunk)
     (run / "stop").touch()
     assert serve(models, run) == 0
     got = answers(run, "big")
     assert [r["id"] for r in got] == [f"big-{i}" for i in range(5)]
-    assert [r["answer"] for r in answers(run, "later")] == ["Z"]
     done = json.loads((run / "outbox" / "big.json").read_text())
     assert done["prompt_tokens_this_job"] > 0 and done["n_prompts"] == 5
+    assert StepEngine.made[-1].most == 3  # only the three left were given to the engine
+
+
+def test_prompts_that_dont_finish_in_time_are_dropped_and_redone(tmp_path, text_vllm, monkeypatch):
+    models, run = make_run(tmp_path)
+    clock = Clock(monkeypatch)
+    add_raw_request(
+        run, "slow", [{"id": "s", "messages": user("go on"), "generate": {"max_tokens": 5000}}]
+    )
+
+    def a_minute_passes():
+        clock.t += 60
+
+    StepEngine.hooks[1] = llm_serve.stopping.set
+    for n in range(2, 60):  # the 50 steps the answer needs take longer than the grace period
+        StepEngine.hooks[n] = a_minute_passes
+    assert serve(models, run) == 0
+    assert not StepEngine.made[-1].running  # dropped from the engine
+    assert not (run / "outbox" / "slow.partial.jsonl.gz").exists()
+    summary = json.loads((run / "output" / "summary.json").read_text())
+    assert summary["left_in_inbox"] == ["slow"]
+
+
+def test_requests_share_the_engine_and_new_ones_join_at_once(tmp_path, text_vllm, monkeypatch):
+    """A long answer doesn't hold up a short request that arrives while it is written, and
+    prompts from different requests run side by side."""
+    models, run = make_run(tmp_path, max_num_seqs=8, poll_seconds=0.2)
+    clock = Clock(monkeypatch)
+    add_raw_request(
+        run, "long", [{"id": "l", "messages": user("write lots"), "generate": {"max_tokens": 900}}]
+    )
+
+    def arrive():
+        clock.t += 1  # time for the server to look in inbox/ again
+        add_request(run, "quick", ["about timescales", "about nothing"])
+
+    StepEngine.hooks[2] = arrive
+    StepEngine.hooks[5] = lambda: (run / "stop").touch()
+    assert serve(models, run) == 0
+    events = [json.loads(line) for line in (run / "events.log").read_text().splitlines()]
+    assert [e["request"] for e in events] == ["quick", "long"]  # quick didn't wait
+    assert [r["answer"] for r in answers(run, "quick")] == ["B", "Z"]
+    assert answers(run, "long")[0]["text"] == "echo write lots"
+    assert StepEngine.made[-1].most == 3  # all three prompts were in the engine together
+
+
+def test_the_engine_is_kept_full_but_not_overfilled(tmp_path, fake_vllm, monkeypatch):
+    models, run = make_run(tmp_path, max_num_seqs=4)
+    Clock(monkeypatch)
+    add_request(run, "a", ["about timescales"] * 12)
+    add_request(run, "b", ["about nothing"] * 3)
+    (run / "stop").touch()
+    assert serve(models, run) == 0
+    assert StepEngine.made[-1].most == 5  # max_num_seqs and one waiting
+    assert StepEngine.made[-1].steps == 3  # 15 prompts, 5 at a time
+    # the requests were taken in turn, so the short one finished first
+    events = [json.loads(line) for line in (run / "events.log").read_text().splitlines()]
+    assert [e["request"] for e in events] == ["b", "a"]
+    assert len(answers(run, "a")) == 12 and len(answers(run, "b")) == 3
 
 
 def test_a_bad_request_is_refused_and_the_rest_answered(tmp_path, fake_vllm, monkeypatch):

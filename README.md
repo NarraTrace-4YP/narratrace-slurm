@@ -71,13 +71,20 @@ text as Qwen's `<tool_call>` blocks. `llm_serve.py`'s docstring has the details.
 
 A request is data only. The job checks every prompt against fixed limits and refuses a file
 that isn't valid; nothing in a request can choose the model, a file or a command, and tools
-are only descriptions for the model to read (the job never runs them). Requests are
-answered one at a time, oldest first.
+are only descriptions for the model to read (the job never runs them).
+
+Every request in `inbox/` is worked on at once. The job drives vLLM's engine step by step
+(continuous batching, as vLLM's own server does): it keeps about `max_num_seqs` prompts
+running, takes them from each waiting request in turn, and puts the next prompt in as soon as
+one finishes. So a short request that arrives while a long answer is being written is answered
+straight away, and many small requests (as the platform's gateway sends) fill the GPU
+together. A request's answers are written to `outbox/` when its last prompt finishes.
 
 The job stops when it is asked to (after answering what is already in `inbox/`), when
 nothing has arrived for `idle_minutes` (so it doesn't hold a shared GPU doing nothing), or
-15 minutes before its time limit, when SLURM sends it `USR1`: it finishes the chunk it is on
-and leaves the rest in `inbox/`. If SLURM requeues it in the same folder, it carries on
+15 minutes before its time limit, when SLURM sends it `USR1`: it takes nothing new, gives the
+prompts already started up to 10 minutes to finish, saves their answers, and leaves the
+unfinished requests in `inbox/`. If SLURM requeues it in the same folder, it carries on
 where it stopped.
 
 Each new Windmill login needs a new 2FA code, so adding prompts from separate Windmill runs

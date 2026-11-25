@@ -1,5 +1,21 @@
 """Keep a model loaded on a Blythe GPU and answer prompts as Windmill adds them (a mailbox).
 
+Fix (25 Nov 2026, problem review "llm_serve answers in rounds"):
+    Problem: the job answered one request file at a time, in chunks, with the blocking
+    llm.generate(). Each chunk waited for its slowest answer, and the platform's gateway
+    sends many small files (one per batch of WeKnora calls), so the GPU only ever had a few
+    prompts to work on: about 6 at once on Blythe, where vLLM's own server on a PC with the
+    same model managed about 19.
+    Why: llm.generate() takes a fixed list of prompts and returns when the last is done.
+    Nothing new can join until then, and only one request file was read at a time.
+    Solution: the job now drives vLLM's engine step by step (continuous batching, as vLLM's
+    own server does). Every request file in inbox/ is taken as soon as it appears; its
+    prompts are handed to the engine, a few from each request in turn, keeping about
+    max_num_seqs of them running; each step writes one more token for every running prompt,
+    and as soon as one finishes the next takes its place. A file's answers are written out
+    when its last prompt finishes. The mailbox files, checks, limits and stop rules are the
+    same; status.json now also says how many requests and prompts are in progress.
+
 The llm_serve.sbatch job runs this in a run folder Windmill made:
 
     python llm_serve.py --models ~/narratrace/models <run folder>
@@ -25,11 +41,12 @@ a hidden temporary name and then renamed, so the job never reads half a file:
         calls come back in the answer's text (Qwen writes them as <tool_call> blocks).
         Generation prompts' messages may also have role "tool", tool_calls and
         tool_call_id, as in OpenAI's chat format.
-<request> is 1 to 64 letters, digits, '_' or '-'. Requests are answered one at a time,
-oldest first. Anything else in inbox/ is left alone.
+<request> is 1 to 64 letters, digits, '_' or '-'. Every request waiting is worked on at
+once (oldest first when there is a queue), sharing the GPU prompt by prompt. Anything else in
+inbox/ is left alone.
 
 The answers go in outbox/:
-    <request>.partial.jsonl.gz   answers so far, saved chunk by chunk
+    <request>.partial.jsonl.gz   answers so far, saved every chunk_size answers (or 30 s)
     <request>.jsonl.gz           every answer, once the request is finished: for a label
                                  prompt llm_batch.py's results format; for a generation
                                  prompt {"id", "meta", "text", "reasoning", "finish_reason",
@@ -50,8 +67,9 @@ The job stops:
     - when a file named "stop" appears in the run folder, after answering everything
       already in inbox/;
     - when nothing has arrived for idle_minutes, so an idle job doesn't hold a shared GPU;
-    - when SLURM warns that the time limit is near (SIGUSR1, see llm_serve.sbatch): it
-      finishes the chunk it is on and leaves the rest of its requests in inbox/.
+    - when SLURM warns that the time limit is near (SIGUSR1, see llm_serve.sbatch): it takes
+      nothing new, gives the prompts already started up to 10 minutes to finish, saves
+      their answers, and leaves the unfinished requests in inbox/.
 If SLURM requeues the job in the same folder, it carries on: unfinished requests are still in
 inbox/, and prompts already in a partial file aren't answered again.
 
@@ -67,6 +85,7 @@ import argparse
 import gzip
 import hashlib
 import json
+import math
 import os
 import platform
 import re
@@ -83,13 +102,13 @@ import llm_batch
 from llm_batch import (
     THINK_CLOSE,
     THINK_OPEN,
-    answer_chunk,
     append_results,
     close_thinking,
     engine_settings,
     gpu_details,
     load_model,
     log,
+    pick_answer,
     read_done,
     rewrite_results,
     set_env,
@@ -107,7 +126,11 @@ DEFAULT_MAX_TOKENS, MAX_TOKENS = 1024, 32768
 MAX_STOPS, MAX_STOP_CHARS = 8, 100
 MAX_SCHEMA_BYTES, MAX_TOOLS, MAX_TOOLS_BYTES = 50_000, 64, 200_000
 TOOL_NAME = re.compile(r"^[A-Za-z0-9_-]{1,64}$")
-STATUS_EVERY = 60  # seconds: status.json is rewritten at least this often while waiting
+STATUS_EVERY = 60  # seconds: status.json is rewritten at least this often
+STATUS_GAP = 2  # seconds: and at most this often while answering
+SAVE_EVERY = 30  # seconds: answers are added to the partial files at least this often
+STOP_GRACE = 600  # seconds the time limit warning leaves started prompts to finish
+LOG_EVERY = 60  # seconds between progress lines in the log while answering
 CALLBACK_TRIES, CALLBACK_GAP = 6, 20  # as the job files' own wake-up call
 
 # Replaced in the tests, so they can move time on without waiting.
@@ -325,7 +348,7 @@ def call_back(url: str, body: dict) -> None:
             sleep(CALLBACK_GAP)
 
 
-# ---------------------------------------------------------------- writing answers
+# ---------------------------------------------------------------- building and reading prompts
 
 
 def structured_output(schema: dict) -> dict:
@@ -340,6 +363,17 @@ def structured_output(schema: dict) -> dict:
         return {"guided_decoding": GuidedDecodingParams(json=schema)}
 
 
+def final_only(params):
+    """Asks vLLM to hand back an answer only once it is finished, not after every token."""
+    try:
+        from vllm.sampling_params import RequestOutputKind
+
+        params.output_kind = RequestOutputKind.FINAL_ONLY
+    except (ImportError, AttributeError):  # an older vLLM, or the tests' stand-in
+        pass
+    return params
+
+
 def split_thinking(text: str) -> tuple[str | None, str]:
     """(reasoning, answer) from a reply that may start with a thinking block."""
     if THINK_CLOSE not in text:
@@ -348,17 +382,10 @@ def split_thinking(text: str) -> tuple[str | None, str]:
     return reasoning.replace(THINK_OPEN, "").strip(), answer.lstrip()
 
 
-def generate_chunk(llm, tokenizer, prompts: list[dict], request: dict) -> list[dict]:
-    """Writes an answer to each generation prompt. One prompt that vLLM refuses (a schema it
-    can't follow, say) gets an error; the others are still answered."""
-    from vllm import SamplingParams
-
-    has_think = THINK_OPEN in tokenizer.get_vocab()
-    results, to_run = [], []
-    for prompt in prompts:
-        settings = prompt["generate"]
-        thinking = bool(settings.get("thinking"))
-        result = {
+def empty_result(prompt: dict) -> dict:
+    """A prompt's result before the model has answered, in the format of its kind."""
+    if is_generation(prompt):
+        return {
             "id": prompt["id"],
             "meta": prompt.get("meta"),
             "text": None,
@@ -368,7 +395,29 @@ def generate_chunk(llm, tokenizer, prompts: list[dict], request: dict) -> list[d
             "completion_tokens": None,
             "error": None,
         }
-        try:
+    return {
+        "id": prompt["id"],
+        "meta": prompt.get("meta"),
+        "answer": None,
+        "probabilities": {},
+        "label_mass": 0.0,
+        "prompt_tokens": None,
+        "error": None,
+    }
+
+
+def build(tokenizer, prompt: dict, request: dict, has_think: bool):
+    """(result, token ids, SamplingParams) for one prompt, as llm_batch.answer_chunk builds a
+    label prompt (one token, with its likeliest alternatives) and generate settings a
+    generation prompt. Token ids are None when the prompt can't be run: the result then
+    says why."""
+    from vllm import SamplingParams
+
+    result = empty_result(prompt)
+    try:
+        if is_generation(prompt):
+            settings = prompt["generate"]
+            thinking = bool(settings.get("thinking"))
             options = {"tools": prompt["tools"]} if prompt.get("tools") else {}
             text = tokenizer.apply_chat_template(
                 prompt["messages"],
@@ -379,39 +428,47 @@ def generate_chunk(llm, tokenizer, prompts: list[dict], request: dict) -> list[d
             )
             if not thinking:
                 text = close_thinking(text, has_think)
-            token_ids = tokenizer(text, add_special_tokens=False)["input_ids"]
-            result["prompt_tokens"] = len(token_ids)
-            room = request["max_model_len"] - len(token_ids)
-            if room < 1:
-                result["error"] = f"prompt too long ({len(token_ids)} tokens)"
-            else:
-                params = SamplingParams(
-                    max_tokens=min(settings.get("max_tokens", DEFAULT_MAX_TOKENS), room),
-                    temperature=settings.get("temperature", 0.0),
-                    top_p=settings.get("top_p", 1.0),
-                    stop=settings.get("stop") or None,
-                    seed=settings.get("seed"),
-                    **(
-                        structured_output(settings["json_schema"])
-                        if "json_schema" in settings
-                        else {}
-                    ),
-                )
-                to_run.append((result, token_ids, params, thinking))
-        except Exception as error:  # noqa: BLE001 - one bad prompt mustn't stop the batch
-            result["error"] = f"couldn't build the prompt: {error}"
-        results.append(result)
-
-    def run(batch):
-        return llm.generate(
-            [{"prompt_token_ids": ids} for _, ids, _, _ in batch],
-            [params for _, _, params, _ in batch],
-            use_tqdm=False,
+        else:
+            text = tokenizer.apply_chat_template(
+                prompt["messages"],
+                tokenize=False,
+                add_generation_prompt=True,
+                enable_thinking=False,
+            )
+            text = close_thinking(text, has_think)
+        token_ids = tokenizer(text, add_special_tokens=False)["input_ids"]
+    except Exception as error:  # noqa: BLE001 - one bad prompt mustn't stop the others
+        result["error"] = f"couldn't build the prompt: {error}"
+        return result, None, None
+    result["prompt_tokens"] = len(token_ids)
+    room = request["max_model_len"] - len(token_ids)
+    if room < 1:
+        result["error"] = f"prompt too long ({len(token_ids)} tokens)"
+        return result, None, None
+    if not is_generation(prompt):
+        params = SamplingParams(max_tokens=1, temperature=0.0, logprobs=request["top_logprobs"])
+        return result, token_ids, final_only(params)
+    try:
+        settings = prompt["generate"]
+        params = SamplingParams(
+            max_tokens=min(settings.get("max_tokens", DEFAULT_MAX_TOKENS), room),
+            temperature=settings.get("temperature", 0.0),
+            top_p=settings.get("top_p", 1.0),
+            stop=settings.get("stop") or None,
+            seed=settings.get("seed"),
+            **(structured_output(settings["json_schema"]) if "json_schema" in settings else {}),
         )
+    except Exception as error:  # noqa: BLE001
+        result["error"] = f"couldn't build the prompt: {error}"
+        return result, None, None
+    return result, token_ids, final_only(params)
 
-    def record(item, output) -> None:
-        result, _, _, thinking = item
-        out = output.outputs[0]
+
+def read_output(tokenizer, prompt: dict, result: dict, output) -> None:
+    """Fills result in from vLLM's finished output for prompt."""
+    out = output.outputs[0]
+    if is_generation(prompt):
+        thinking = bool(prompt["generate"].get("thinking"))
         reasoning, text = split_thinking(out.text) if thinking else (None, out.text)
         result.update(
             text=text,
@@ -419,18 +476,18 @@ def generate_chunk(llm, tokenizer, prompts: list[dict], request: dict) -> list[d
             finish_reason=out.finish_reason,
             completion_tokens=len(out.token_ids),
         )
-
-    if to_run:
-        try:
-            for item, output in zip(to_run, run(to_run), strict=True):
-                record(item, output)
-        except Exception:  # noqa: BLE001 - find the prompt vLLM refused, answer the rest
-            for item in to_run:
-                try:
-                    record(item, run([item])[0])
-                except Exception as error:  # noqa: BLE001
-                    item[0]["error"] = f"the model couldn't answer: {error}"
-    return results
+        return
+    first = out.logprobs[0] if out.logprobs else {}
+    top = {}
+    for token_id, logprob in first.items():
+        token = logprob.decoded_token
+        if token is None:
+            token = tokenizer.decode([token_id])
+        top[token] = max(top.get(token, -math.inf), logprob.logprob)
+    answer, probabilities, mass = pick_answer(top, prompt["labels"])
+    result.update(answer=answer, probabilities=probabilities, label_mass=mass)
+    if answer is None:
+        result["error"] = "no label among the model's likeliest first tokens"
 
 
 def answered(result: dict) -> bool:
@@ -440,7 +497,51 @@ def answered(result: dict) -> bool:
 # ---------------------------------------------------------------- the server
 
 
+class Job:
+    """One request file being answered: its prompts, the answers so far, and the prompts
+    not yet given to the model."""
+
+    def __init__(self, request_id: str, prompts: list[dict], sha256: str, partial: Path):
+        self.request_id, self.prompts, self.sha256, self.partial = (
+            request_id,
+            prompts,
+            sha256,
+            partial,
+        )
+        self.results: dict[str, dict] = {}  # prompt id -> result, in any order
+        self.queue: list[dict] = []  # prompts not yet given to the model
+        self.in_flight = 0  # prompts the model is working on
+        self.unsaved: list[dict] = []  # results not yet in the partial file
+        self.saved_at = now()
+        self.started, self.first_submit = utc(), None
+        self.prompt_tokens = self.completion_tokens = 0
+
+    def done(self) -> bool:
+        return not self.queue and not self.in_flight
+
+    def add(self, result: dict) -> None:
+        self.results[result["id"]] = result
+        self.unsaved.append(result)
+        self.prompt_tokens += result["prompt_tokens"] or 0
+        self.completion_tokens += result.get("completion_tokens") or 0
+
+    def save(self) -> None:
+        """Adds the results not yet saved to the partial file, so a job that is stopped
+        doesn't answer them again."""
+        if self.unsaved:
+            append_results(self.partial, self.unsaved)
+            self.unsaved = []
+        self.saved_at = now()
+
+
 class Server:
+    """Keeps the model busy: every request in inbox/ is taken as soon as it arrives, and its
+    prompts are handed to vLLM's engine a few at a time, so the engine always has about
+    max_num_seqs prompts to work on together. Each step of the engine writes one more token
+    of every prompt it is working on; a prompt that finishes makes room for the next at once
+    (continuous batching), so short and long answers, and prompts from different requests,
+    share the GPU instead of waiting for each other."""
+
     def __init__(self, folder: Path, request: dict, llm, tokenizer, record: dict):
         self.folder, self.request, self.llm, self.tokenizer = folder, request, llm, tokenizer
         self.inbox, self.outbox = folder / "inbox", folder / "outbox"
@@ -459,13 +560,37 @@ class Server:
             "completion_tokens": 0,
         }
         self.seconds_generating = 0.0
+        self.jobs: dict[str, Job] = {}  # requests being answered, in the order they were taken
+        self.engine_ids: dict[str, tuple[Job, dict, dict]] = {}  # vLLM request id -> its prompt
+        self.counter = 0
+        self.has_think = False
+        self.most_in_flight = 0
+        self.logged_at = now()
+
+    @property
+    def engine(self):
+        return self.llm.llm_engine
+
+    @property
+    def in_flight(self) -> int:
+        return len(self.engine_ids)
+
+    def room(self) -> int:
+        """How many prompts the engine is given at once: max_num_seqs, plus a few waiting so
+        a finished prompt's place is filled straight away."""
+        most = int(self.request["max_num_seqs"])
+        return most + max(1, most // 4)
 
     # --- status.json
 
     def set_status(self, state: str, force: bool = False, **details) -> None:
+        """Rewrites status.json when the state changes, when its details change (at most every
+        STATUS_GAP seconds) and at least every STATUS_EVERY seconds."""
         status = {"state": state, **details}
-        if not force and status == self.status and now() - self.status_written < STATUS_EVERY:
-            return
+        if not force and state == self.status.get("state"):
+            gap = STATUS_EVERY if status == self.status else STATUS_GAP
+            if now() - self.status_written < gap:
+                return
         self.status, self.status_written = status, now()
         write_json(
             self.folder / "status.json",
@@ -478,7 +603,18 @@ class Server:
             },
         )
 
-    # --- one request
+    def answering_status(self) -> None:
+        jobs = list(self.jobs.values())
+        self.set_status(
+            "answering",
+            requests=[job.request_id for job in jobs][:20],
+            n_requests=len(jobs),
+            prompts_in_flight=self.in_flight,
+            answered=sum(len(job.results) for job in jobs),
+            of=sum(len(job.prompts) for job in jobs),
+        )
+
+    # --- finishing or refusing a request
 
     def finish(self, request_id: str, body: dict) -> None:
         """Removes the request from inbox/ and calls its callback (in the background)."""
@@ -508,104 +644,182 @@ class Server:
         log(f"Refused request {request_id}: {error}")
         self.finish(request_id, body)
 
-    def answer(self, request_id: str) -> bool:
-        """Answers one request. False if the time limit warning stopped it part way (the
-        request stays in inbox/, its answers so far in the partial file)."""
+    def take(self, request_id: str) -> None:
+        """Starts answering a request in inbox/: checks it, and queues the prompts that the
+        partial file (from before a requeue) doesn't already answer."""
         path = self.inbox / f"{request_id}{PROMPTS_SUFFIX}"
         try:
-            prompts_sha256 = hashlib.sha256(path.read_bytes()).hexdigest()
+            raw = path.read_bytes()
             prompts = read_request_prompts(path)
             check_prompts(prompts)
         except FileNotFoundError:
-            return True  # removed before it could be read
+            return  # removed before it could be read
         except Exception as error:  # noqa: BLE001 - a bad file is refused, not fatal
             self.refuse(request_id, error)
-            return True
-
-        started = utc()
+            return
         partial = self.outbox / f"{request_id}.partial{PROMPTS_SUFFIX}"
+        job = Job(request_id, prompts, hashlib.sha256(raw).hexdigest(), partial)
         ids = {p["id"] for p in prompts}
         done = [r for r in read_done(partial) if r["id"] in ids]
         if done:
             rewrite_results(partial, done)
-        done_ids = {r["id"] for r in done}
-        todo = [p for p in prompts if p["id"] not in done_ids]
-        log(f"Request {request_id}: {len(prompts)} prompt(s), {len(todo)} to answer")
-        size = max(1, int(self.request["chunk_size"]))
-        tokens = completion_tokens = 0
-        seconds = 0.0
-        for start in range(0, len(todo), size):
-            self.set_status(
-                "answering",
-                force=True,
-                request=request_id,
-                answered=len(done_ids) + start,
-                of=len(prompts),
-            )
-            t0 = now()
-            chunk = todo[start : start + size]
-            labelled = [p for p in chunk if not is_generation(p)]
-            generated = [p for p in chunk if is_generation(p)]
-            results = []
-            if labelled:
-                results += answer_chunk(self.llm, self.tokenizer, labelled, self.request)
-            if generated:
-                results += generate_chunk(self.llm, self.tokenizer, generated, self.request)
-            append_results(partial, results)
-            seconds += now() - t0
-            tokens += sum(r["prompt_tokens"] or 0 for r in results)
-            completion_tokens += sum(r.get("completion_tokens") or 0 for r in results)
-            if stopping.is_set() and start + size < len(todo):
-                self.seconds_generating += seconds
-                log(f"Request {request_id}: stopped part way for the time limit")
-                return False
+        job.results = {r["id"]: r for r in done}
+        job.queue = [p for p in prompts if p["id"] not in job.results]
+        self.jobs[request_id] = job
+        log(f"Request {request_id}: {len(prompts)} prompt(s), {len(job.queue)} to answer")
 
-        by_id = {r["id"]: r for r in read_done(partial)}
-        missing = [p["id"] for p in prompts if p["id"] not in by_id]
+    def complete(self, job: Job) -> None:
+        """Writes a finished request's answers and summary, and lets whoever sent it know."""
+        job.save()
+        del self.jobs[job.request_id]
+        by_id = {r["id"]: r for r in read_done(job.partial)}
+        missing = [p["id"] for p in job.prompts if p["id"] not in by_id]
         if missing:
-            raise RuntimeError(f"request {request_id}: {len(missing)} answers weren't saved")
-        final = self.outbox / f"{request_id}{PROMPTS_SUFFIX}"
-        rewrite_results(final, [by_id[p["id"]] for p in prompts])
-        partial.unlink(missing_ok=True)
+            raise RuntimeError(f"request {job.request_id}: {len(missing)} answers weren't saved")
+        final = self.outbox / f"{job.request_id}{PROMPTS_SUFFIX}"
+        rewrite_results(final, [by_id[p["id"]] for p in job.prompts])
+        job.partial.unlink(missing_ok=True)
         every = list(by_id.values())
+        seconds = now() - job.first_submit if job.first_submit is not None else 0.0
         body = {
-            "request": request_id,
+            "request": job.request_id,
             "status": "answered",
-            "n_prompts": len(prompts),
+            "n_prompts": len(job.prompts),
             "n_answered": sum(1 for r in every if answered(r)),
             "n_no_answer": sum(1 for r in every if not answered(r)),
             "n_too_long": sum(1 for r in every if (r["error"] or "").startswith("prompt too long")),
-            "prompts_sha256": prompts_sha256,
-            "prompt_tokens_this_job": tokens,
-            "completion_tokens_this_job": completion_tokens,
-            "seconds_generating": round(seconds, 1),
-            "started": started,
+            "prompts_sha256": job.sha256,
+            "prompt_tokens_this_job": job.prompt_tokens,
+            "completion_tokens_this_job": job.completion_tokens,
+            "seconds_generating": round(seconds, 1),  # from its first prompt to its last
+            "started": job.started,
             "finished": utc(),
         }
-        write_json(self.outbox / f"{request_id}.json", body)
+        write_json(self.outbox / f"{job.request_id}.json", body)
         self.totals["requests"] += 1
-        self.totals["prompts"] += len(prompts)
-        self.totals["prompt_tokens"] += tokens
-        self.totals["completion_tokens"] += completion_tokens
-        self.seconds_generating += seconds
-        log(f"Request {request_id}: done, {body['n_answered']} of {len(prompts)} answered")
-        self.finish(request_id, body)
-        return True
+        self.totals["prompts"] += len(job.prompts)
+        self.totals["prompt_tokens"] += job.prompt_tokens
+        self.totals["completion_tokens"] += job.completion_tokens
+        log(f"Request {job.request_id}: done, {body['n_answered']} of {len(job.prompts)} answered")
+        self.finish(job.request_id, body)
+
+    # --- feeding the engine
+
+    def top_up(self) -> None:
+        """Gives the engine prompts until it has room() of them, taking one from each request
+        in turn, so a short request isn't stuck behind a long one."""
+        while self.in_flight < self.room():
+            jobs = [job for job in self.jobs.values() if job.queue]
+            if not jobs:
+                return
+            for job in jobs:
+                if self.in_flight >= self.room():
+                    return
+                self.submit(job, job.queue.pop(0))
+
+    def submit(self, job: Job, prompt: dict) -> None:
+        result, token_ids, params = build(self.tokenizer, prompt, self.request, self.has_think)
+        if token_ids is None:
+            job.add(result)  # too long, or couldn't be built: answered with its error
+            return
+        self.counter += 1
+        engine_id = f"{job.request_id}/{self.counter}"
+        try:
+            self.engine.add_request(engine_id, {"prompt_token_ids": token_ids}, params)
+        except Exception as error:  # noqa: BLE001 - vLLM refused this prompt (a schema it
+            # can't follow, say): it gets an error, and the others are still answered
+            result["error"] = f"the model couldn't answer: {error}"
+            job.add(result)
+            return
+        if job.first_submit is None:
+            job.first_submit = now()
+        job.in_flight += 1
+        self.engine_ids[engine_id] = (job, prompt, result)
+        self.most_in_flight = max(self.most_in_flight, self.in_flight)
+
+    def step(self) -> None:
+        """Runs one step of the engine and records the prompts it finished."""
+        t0 = now()
+        outputs = self.engine.step()
+        self.seconds_generating += now() - t0
+        for output in outputs:
+            if not getattr(output, "finished", True) or output.request_id not in self.engine_ids:
+                continue
+            job, prompt, result = self.engine_ids.pop(output.request_id)
+            job.in_flight -= 1
+            try:
+                read_output(self.tokenizer, prompt, result, output)
+            except Exception as error:  # noqa: BLE001
+                result["error"] = f"couldn't read the model's answer: {error}"
+            job.add(result)
+
+    def save_and_complete(self, final: bool = False) -> None:
+        """Saves answers to the partial files every chunk_size answers (or SAVE_EVERY
+        seconds), and writes out each request that is finished."""
+        size = max(1, int(self.request["chunk_size"]))
+        for job in list(self.jobs.values()):
+            if job.done() and not final:
+                self.complete(job)
+            elif job.unsaved and (
+                final or len(job.unsaved) >= size or now() - job.saved_at >= SAVE_EVERY
+            ):
+                job.save()
+
+    def stop_engine(self) -> None:
+        """Called when the time limit is near: lets the prompts in the engine finish (for up
+        to STOP_GRACE seconds), saves their answers, and drops the rest. The unfinished
+        requests stay in inbox/ for a requeued job."""
+        if self.in_flight:
+            log(f"Time limit near: finishing the {self.in_flight} prompt(s) already started")
+        deadline = now() + STOP_GRACE
+        while self.in_flight and now() < deadline:
+            self.step()
+            self.save_and_complete()
+        if self.in_flight:
+            log(f"Dropping {self.in_flight} unfinished prompt(s); a requeued job redoes them")
+            self.engine.abort_request(list(self.engine_ids))
+            self.engine_ids.clear()
+        for job in list(self.jobs.values()):
+            if job.done():
+                self.complete(job)
+        self.save_and_complete(final=True)
+
+    def log_progress(self) -> None:
+        if now() - self.logged_at >= LOG_EVERY:
+            self.logged_at = now()
+            log(
+                f"{len(self.jobs)} request(s) open, {self.in_flight} prompt(s) in the engine,"
+                f" {self.totals['requests']} request(s) done"
+            )
 
     # --- the loop
 
     def run(self) -> str:
         """Answers requests until it is told to stop or has been idle too long; returns why
         it stopped."""
+        self.has_think = THINK_OPEN in self.tokenizer.get_vocab()
         idle_seconds = self.request["idle_minutes"] * 60
         last_work = now()
+        looked = None  # when inbox/ was last listed
         while True:
             if stopping.is_set():
+                self.stop_engine()
                 return "time limit near"
-            waiting = waiting_requests(self.inbox)
-            if waiting:
-                if not self.answer(waiting[0]):
-                    return "time limit near"
+            busy = bool(self.jobs)
+            # Look for new requests every poll_seconds (each step only takes a moment).
+            if looked is None or not busy or now() - looked >= self.request["poll_seconds"]:
+                looked = now()
+                for request_id in waiting_requests(self.inbox):
+                    if request_id not in self.jobs:
+                        self.take(request_id)
+                self.save_and_complete()  # a request whose prompts were all done already
+            if self.jobs:
+                self.top_up()
+                if self.in_flight:
+                    self.step()
+                self.save_and_complete()
+                self.answering_status()
+                self.log_progress()
                 last_work = now()
                 continue
             if (self.folder / "stop").exists():
