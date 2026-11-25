@@ -87,6 +87,11 @@ prompts already started up to 10 minutes to finish, saves their answers, and lea
 unfinished requests in `inbox/`. If SLURM requeues it in the same folder, it carries on
 where it stopped.
 
+To watch the prompts going in and the answers coming out of a running job, live, run
+`~/narratrace/env/bin/python ~/narratrace/slurm/watch_prompts.py` on Blythe in a second
+terminal (it reads the newest gateway run folder; give a run folder to watch another; add
+`--full` for whole prompts). It only reads files.
+
 Each new Windmill login needs a new 2FA code, so adding prompts from separate Windmill runs
 suits batches of work. The platform's LLM gateway instead keeps one login open per person,
 which makes one question at a time practical too. Every request leaves two small files in `outbox/`, and
