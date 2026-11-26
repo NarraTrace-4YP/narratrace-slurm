@@ -675,3 +675,26 @@ def test_polling_can_be_quicker_than_a_second(tmp_path, text_vllm, monkeypatch):
     assert clock.t - 1_000_000.0 == 60
     models, run = make_run(tmp_path / "again", poll_seconds=0.1)
     assert serve(models, run) == 2
+
+
+def test_the_gateways_two_gpu_request_is_accepted(tmp_path):
+    """The LLM gateway's full-precision request (26 Nov 2026): split over two GPUs, without
+    CUDA graphs or vLLM's own all-reduce, with 131,072-token prompts."""
+    _, run = make_run(
+        tmp_path,
+        max_model_len=131072,
+        max_num_seqs=64,
+        gpu_memory_utilization=0.85,
+        engine={
+            "tensor_parallel_size": 2,
+            "enforce_eager": True,
+            "disable_custom_all_reduce": True,
+        },
+    )
+    request = llm_serve.read_request(run)
+    assert llm_serve.engine_settings(request) == {
+        "tensor_parallel_size": 2,
+        "enforce_eager": True,
+        "disable_custom_all_reduce": True,
+    }
+    assert request["max_model_len"] == 131072

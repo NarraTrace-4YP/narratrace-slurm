@@ -29,7 +29,7 @@ It never sends commands of its own. The job names Windmill may submit are listed
 | `jobs/setup_env.sbatch` | Installs uv, Python 3.12 and vLLM 0.34.0 into `~/narratrace/env`, and downloads the model at a fixed commit. Needs no GPU. Run it by hand once, and again after changing a version. |
 | `jobs/test_gpu.sbatch` | Ten minutes on one L40. It reports the GPU and its driver, then calls Windmill back. |
 | `jobs/llm_batch.sbatch` | Answers a batch of one-letter prompts with vLLM on one L40 (`llm_batch.py`; its docstring describes the input and output files). |
-| `jobs/llm_serve.sbatch` | Keeps a model loaded on one L40 and answers prompts that Windmill adds while it runs, with a label or with written text, JSON or tool calls (`llm_serve.py`; see "Adding prompts to a running job" below). The platform's LLM gateway uses it. |
+| `jobs/llm_serve.sbatch` | Keeps a model loaded on one L40 (or split over more when Windmill asks for them: the gateway runs full-precision Qwen3.8-27B on two, and the job first checks the GPUs can talk to each other with `check_gpus.py`) and answers prompts that Windmill adds while it runs, with a label or with written text, JSON or tool calls (`llm_serve.py`; see "Adding prompts to a running job" below). The platform's LLM gateway uses it. |
 
 Each job's last step POSTs to the address in its run folder's `callback_url` (up to six
 tries, 20 s apart). This wakes the waiting Windmill run. Windmill then asks SLURM whether
@@ -86,6 +86,11 @@ nothing has arrived for `idle_minutes` (so it doesn't hold a shared GPU doing no
 prompts already started up to 10 minutes to finish, saves their answers, and leaves the
 unfinished requests in `inbox/`. If SLURM requeues it in the same folder, it carries on
 where it stopped.
+
+To watch the prompts going in and the answers coming out of a running job, live, run
+`~/narratrace/env/bin/python ~/narratrace/slurm/watch_prompts.py` on Blythe in a second
+terminal (it reads the newest gateway run folder; give a run folder to watch another; add
+`--full` for whole prompts). It only reads files.
 
 Each new Windmill login needs a new 2FA code, so adding prompts from separate Windmill runs
 suits batches of work. The platform's LLM gateway instead keeps one login open per person,
